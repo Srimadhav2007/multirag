@@ -14,9 +14,9 @@ import zipfile
 import docx
 import pandas as pd
 
-model=init_chat_model(model="gemini-2.5-flash",model_provider="google-genai")
-image_embedder=SentenceTransformer("clip-ViT-B-32")
-text_embedder=SentenceTransformer("BAAI/bge-base-en-v1.5") #"BAAI/bge-m3"
+model=None
+image_embedder=None
+text_embedder=None
 
 client=PersistentClient(path="./chroma_db")
 text_store = client.get_or_create_collection("rag-text",configuration={"hnsw":{"space":"cosine"}})
@@ -34,6 +34,14 @@ def docnamer(docname: str):
     return ref_docname
 
 def embed(docname:str):
+    if not os.path.exists(docname):
+        raise FileNotFoundError(f"Path not found: '{docname}'")
+    global text_embedder
+    global image_embedder
+    if text_embedder is None:
+        text_embedder=SentenceTransformer("BAAI/bge-base-en-v1.5") #"BAAI/bge-m3"
+    if image_embedder is None:
+        image_embedder=SentenceTransformer("clip-ViT-B-32")
     ext=docname[docname.rfind('.')+1:]
     if ext=="docx" or ext=="doc":
         embed_from_doc(docname)
@@ -45,6 +53,9 @@ def embed(docname:str):
         embed_from_image(docname)
     elif ext=="xlsx":
         embed_from_xlsx(docname)
+    elif os.path.isdir(docname):
+        for file in os.listdir(docname):
+            embed(os.path.join(docname,file))
 
 def embed_from_pdf(docname:str):
     ref_docname=docnamer(docname)
@@ -71,17 +82,59 @@ def embed_from_pdf(docname:str):
             tamd.extend([{"docname": f"{ref_docname}","page": f"{pages}","table": f"{i}","type": "table"} for i in range(len(tab_list.tables))])
             taids.extend([f"{ref_docname}_p{pages}_t{i}" for i in range(len(tab_list.tables))])
         if img_list:
-            for img in img_list:
+            for i,img in enumerate(img_list):
                 img=doc.extract_image(img[0])
                 img=Image.open(io.BytesIO(img['image']))
+                iid=f"{ref_docname}_p{pages}_i{i}"
+                iids.append(iid)
+                imd.append({"docname": f"{ref_docname}","page": f"{pages}","imno": f"{i}","type": "image/png"})
                 images.append(img)
-            imd.extend([{"docname": f"{ref_docname}","page": f"{pages}","imno": f"{i}","type": "image/png"} for i in range(len(img_list))])
-            iids.extend([f"{ref_docname}_p{pages}_i{i}" for i in range(len(img_list))])
         split=text_splitter.split_text(text)
         tids.extend([f"{ref_docname}_p{pages}_c{i}" for i in range(len(split))])
         tmd.extend([{"docname": f"{ref_docname}","page": f"{pages}","chunk": f"{i}","type": "text",} for i in range(len(split))])
         splits.extend(split)
         pages+=1
+        if pages%200==0:
+            for iid,image in zip(iids,images):
+                image.save(f"./temp/images/{ref_docname}/{iid}.png")
+            if os.path.exists("./temp/text.json"):
+                with open("./temp/text.json", "r", encoding="utf-8") as f:
+                    text_lookup = json.load(f)
+            else:
+                text_lookup = {}
+            text_lookup.setdefault(ref_docname,{})
+            text_lookup[ref_docname].update(dict(zip(tids,splits)))
+            with open(f"./temp/text.json","w",encoding="utf-8") as f:
+                json.dump(text_lookup,f,indent=4)
+
+            if os.path.exists("./temp/tables.json"):
+                with open("./temp/tables.json", "r", encoding="utf-8") as f:
+                    table_lookup = json.load(f)
+            else:
+                table_lookup = {}
+            table_lookup.setdefault(ref_docname,{})
+            table_lookup[ref_docname].update(dict(zip(taids,tables)))
+            with open(f"./temp/tables.json","w",encoding="utf-8") as f:
+                json.dump(table_lookup,f,indent=4)
+
+            if splits:
+                t_emb=text_embedder.encode(splits)
+                text_store.upsert(ids=tids,embeddings=t_emb,metadatas=tmd)
+            if images:
+                i_emb=image_embedder.encode(images)
+                image_store.upsert(ids=iids,embeddings=i_emb,metadatas=imd)
+            if tables:
+                ta_emb=text_embedder.encode(tables)
+                table_store.upsert(ids=taids,embeddings=ta_emb,metadatas=tamd)
+            tmd.clear()
+            imd.clear()
+            tamd.clear()
+            images.clear()
+            tids.clear()
+            iids.clear()
+            taids.clear()
+            tables.clear()
+            splits.clear()
 
     for iid,image in zip(iids,images):
         image.save(f"./temp/images/{ref_docname}/{iid}.png")
@@ -114,6 +167,15 @@ def embed_from_pdf(docname:str):
     if tables:
         ta_emb=text_embedder.encode(tables)
         table_store.upsert(ids=taids,embeddings=ta_emb,metadatas=tamd)
+    tmd.clear()
+    imd.clear()
+    tamd.clear()
+    images.clear()
+    tids.clear()
+    iids.clear()
+    taids.clear()
+    tables.clear()
+    splits.clear()
 
 def embed_from_doc(docname: str):
     ref_docname = docnamer(docname)
@@ -126,40 +188,82 @@ def embed_from_doc(docname: str):
     iids = []
     taids = []
     tables = []
-    splits = []
 
-    # 1. EXTRACT AND SAVE IMAGES FROM ZIP ARCHIVE
     i = 0
+    BATCH_SIZE = 50
+    
+    os.makedirs(f"./temp/images/{ref_docname}", exist_ok=True)
+    
     with zipfile.ZipFile(docname, "r") as archive:
         for file in archive.namelist():
             if file.startswith("word/media/"):
-                ext = file.split(".")[-1]
-                # Open image and force load data into RAM immediately
+                ext = file.split(".")[-1] 
                 img = Image.open(io.BytesIO(archive.read(file)))
                 img.load()
                 images.append(img)
-
                 img_id = f"{ref_docname}_i{i}"
                 iids.append(img_id)
-                imd.append({"docname":f"{ref_docname}","imno":f"{i}","type":f"image/{ext}"})
-
-                # Save the image right away to your temp folder
+                imd.append({"docname": f"{ref_docname}", "imno": f"{i}", "type": f"image/{ext}"})
                 img.save(f"./temp/images/{ref_docname}/{img_id}.{ext}")
                 i += 1
+                if len(images) == BATCH_SIZE:
+                    i_emb = image_embedder.encode(images).tolist()
+                    image_store.upsert(ids=iids, embeddings=i_emb, metadatas=imd)    
+                    images.clear()
+                    iids.clear()
+                    imd.clear()
+
+        if images:
+            i_emb = image_embedder.encode(images).tolist()
+            image_store.upsert(ids=iids, embeddings=i_emb, metadatas=imd)
+            
+            images.clear()
+            iids.clear()
+            imd.clear()
 
     # 2. EXTRACT TEXT AND CONVERT TABLES TO MARKDOWN STRINGS
     doc = docx.Document(docname)
 
     paragraph_index = 0
+    text=""
     for p in doc.paragraphs:
-        text_content = p.text.strip()
-        if text_content:
-            split = text_splitter.split_text(text_content)
-            splits.extend(split)
-            tids.extend([f"{ref_docname}_p{paragraph_index}_c{chunk_index}" for chunk_index in range(len(split))])
-            tmd.extend([{"docname":f"{ref_docname}","pno":f"{paragraph_index}","chunk":f"{chunk_index}","type":"text"} for chunk_index in range(len(split))])
+        text+=p.text.strip()
+        if len(text)>=50000:
+            split = text_splitter.split_text(text)
+            tids=[f"{ref_docname}_p{paragraph_index}_c{chunk_index}" for chunk_index in range(len(split))]
+            tmd=[{"docname":f"{ref_docname}","pno":f"{paragraph_index}","chunk":f"{chunk_index}","type":"text"} for chunk_index in range(len(split))]
             paragraph_index += 1
-
+            t_emb = text_embedder.encode(split)
+            text_store.upsert(ids=tids, embeddings=t_emb,metadatas=tmd)
+            if os.path.exists("./temp/text.json"):
+                with open("./temp/text.json", "r", encoding="utf-8") as f:
+                    text_lookup = json.load(f)
+            else:
+                text_lookup = {}
+            text_lookup.setdefault(ref_docname, {})
+            text_lookup[ref_docname].update(dict(zip(tids, split)))
+            with open("./temp/text.json", "w", encoding="utf-8") as f:
+                json.dump(text_lookup, f, indent=4)
+            tids.clear()
+            tmd.clear()
+            text=""
+    if text:
+        split = text_splitter.split_text(text)
+        tids=[f"{ref_docname}_p{paragraph_index}_c{chunk_index}" for chunk_index in range(len(split))]
+        tmd=[{"docname":f"{ref_docname}","pno":f"{paragraph_index}","chunk":f"{chunk_index}","type":"text"} for chunk_index in range(len(split))]
+        t_emb = text_embedder.encode(split)
+        text_store.upsert(ids=tids, embeddings=t_emb,metadatas=tmd)
+        if os.path.exists("./temp/text.json"):
+            with open("./temp/text.json", "r", encoding="utf-8") as f:
+                text_lookup = json.load(f)
+        else:
+            text_lookup = {}
+        text_lookup.setdefault(ref_docname, {})
+        text_lookup[ref_docname].update(dict(zip(tids, split)))
+        with open("./temp/text.json", "w", encoding="utf-8") as f:
+            json.dump(text_lookup, f, indent=4)
+        tids.clear()
+        tmd.clear()
     # Process Document Tables (and convert to Markdown strings)
     for table_idx, table in enumerate(doc.tables):
         markdown_rows = []
@@ -179,15 +283,6 @@ def embed_from_doc(docname: str):
         taids.append(f"{ref_docname}_t{table_idx}")
         tamd.append({"docname":f"{ref_docname}","table":f"{table_idx}","type":"table"})
 
-    if os.path.exists("./temp/text.json"):
-        with open("./temp/text.json", "r", encoding="utf-8") as f:
-            text_lookup = json.load(f)
-    else:
-        text_lookup = {}
-    text_lookup.setdefault(ref_docname, {})
-    text_lookup[ref_docname].update(dict(zip(tids, splits)))
-    with open("./temp/text.json", "w", encoding="utf-8") as f:
-        json.dump(text_lookup, f, indent=4)
 
     if os.path.exists("./temp/tables.json"):
         with open("./temp/tables.json", "r", encoding="utf-8") as f:
@@ -199,34 +294,52 @@ def embed_from_doc(docname: str):
     with open("./temp/tables.json", "w", encoding="utf-8") as f:
         json.dump(table_lookup, f, indent=4)
 
-    if splits:
-        t_emb = text_embedder.encode(splits)
-        text_store.upsert(ids=tids, embeddings=t_emb,metadatas=tmd)
-    if images:
-        i_emb = image_embedder.encode(images)
-        image_store.upsert(ids=iids, embeddings=i_emb,metadatas=imd)
     if tables:
         ta_emb = text_embedder.encode(tables)
         table_store.upsert(ids=taids, embeddings=ta_emb,metadatas=tamd)
 
 def embed_from_txt(docname:str):
     ref_docname=docnamer(docname)
-    with open(docname,"r",encoding="utf-8") as f:
-        text=f.read()
-    splits=text_splitter.split_text(text)
-    ids=[f"{ref_docname}_c{i}" for i in range(len(splits))]
-    mds=[{"docname":ref_docname,"chunk":i,"type":"text"} for i in range(len(splits))]
-    emb=text_embedder.encode(splits)
-    text_store.upsert(ids=ids,metadatas=mds,embeddings=emb)
-    if os.path.exists("./temp/text.json"):
-        with open("./temp/text.json", "r", encoding="utf-8") as f:
-            text_lookup = json.load(f)
-    else:
-        text_lookup = {}
-    text_lookup.setdefault(ref_docname, {})
-    text_lookup[ref_docname].update(dict(zip(ids, splits)))
-    with open("./temp/text.json", "w", encoding="utf-8") as f:
-        json.dump(text_lookup, f, indent=4)
+    c=0
+    l=0
+    with open(docname,"r",encoding="utf-8") as file:
+        text=""
+        for line in file:
+            text+=line
+            l+=1
+            if l==10:
+                split=text_splitter.split_text(text)
+                ids=[f"{ref_docname}_c{c+i}" for i in range(len(split))]
+                mds=[{"docname":ref_docname,"chunk":f"{c+i}","type":"text"} for i in range(len(split))]
+                emb=text_embedder.encode(split)
+                text_store.upsert(ids=ids,metadatas=mds,embeddings=emb)
+                if os.path.exists("./temp/text.json"):
+                    with open("./temp/text.json", "r", encoding="utf-8") as f:
+                        text_lookup = json.load(f)
+                else:
+                    text_lookup = {}
+                text_lookup.setdefault(ref_docname, {})
+                text_lookup[ref_docname].update(dict(zip(ids, split)))
+                with open("./temp/text.json", "w", encoding="utf-8") as f:
+                    json.dump(text_lookup, f, indent=4)
+                l=0
+                text=""
+                c+=len(split)
+        if text.strip():
+            split=text_splitter.split_text(text)
+            ids=[f"{ref_docname}_c{c+i}" for i in range(len(split))]
+            mds=[{"docname":ref_docname,"chunk":f"{c+i}","type":"text"} for i in range(len(split))]
+            emb=text_embedder.encode(split)
+            text_store.upsert(ids=ids,metadatas=mds,embeddings=emb)
+            if os.path.exists("./temp/text.json"):
+                with open("./temp/text.json", "r", encoding="utf-8") as f:
+                    text_lookup = json.load(f)
+            else:
+                text_lookup = {}
+            text_lookup.setdefault(ref_docname, {})
+            text_lookup[ref_docname].update(dict(zip(ids, split)))
+            with open("./temp/text.json", "w", encoding="utf-8") as f:
+                json.dump(text_lookup, f, indent=4)
 
 def embed_from_image(docname:str):
     ref_docname=docnamer(docname)
@@ -257,6 +370,12 @@ def embed_from_xlsx(docname:str):
         json.dump(text_lookup, f, indent=4)
 
 def retrieve(query:str):
+    global text_embedder
+    global image_embedder
+    if text_embedder is None:
+        text_embedder=SentenceTransformer("BAAI/bge-base-en-v1.5") #"BAAI/bge-m3"
+    if image_embedder is None:
+        image_embedder=SentenceTransformer("clip-ViT-B-32")
     with open("./temp/text.json", "r", encoding="utf-8") as f:
         text_lookup = json.load(f)
     with open("./temp/tables.json", "r", encoding="utf-8") as f:
@@ -293,6 +412,9 @@ def retrieve(query:str):
     }
 
 def query(query:str):
+    global model
+    if model==None:
+        model=init_chat_model(model="gemini-2.5-flash",model_provider="google-genai")
     result=retrieve(query)
     parts=[
     {
